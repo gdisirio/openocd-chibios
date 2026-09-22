@@ -93,7 +93,7 @@ static int rt7_read_signature(struct rtos *rtos, struct rt7_signature *signature
 
 	if (memcmp(header, "main", 4) || header[4] || header[5] < sizeof(*signature) ||
 			(target_buffer_get_u16(rtos->target, header + 6) >> 11) != 7) {
-		LOG_ERROR("rt7 requires a ChibiOS/RT 7 debugger signature");
+		LOG_ERROR("chibios-rt7 requires a ChibiOS/RT 7 debugger signature");
 		return ERROR_FAIL;
 	}
 
@@ -108,7 +108,7 @@ static int rt7_read_signature(struct rtos *rtos, struct rt7_signature *signature
 			signature->off_ctx + 4 > signature->threadsize ||
 			signature->off_name + 4 > signature->threadsize ||
 			signature->off_state >= signature->threadsize) {
-		LOG_ERROR("Invalid or unsupported rt7 debugger layout");
+		LOG_ERROR("Invalid or unsupported chibios-rt7 debugger layout");
 		return ERROR_FAIL;
 	}
 
@@ -126,7 +126,7 @@ static bool rt7_detect(struct target *target)
 static int rt7_create(struct target *target)
 {
 	if (!rt7_target_supported(target)) {
-		LOG_ERROR("rt7 does not support target type %s", target_type_name(target));
+		LOG_ERROR("chibios-rt7 does not support target type %s", target_type_name(target));
 		return ERROR_FAIL;
 	}
 
@@ -229,7 +229,7 @@ static int rt7_update_threads(struct rtos *rtos)
 		return retval;
 
 	if (signature.off_sys_reglist || !signature.off_inst_reglist || rtos->target->smp) {
-		LOG_ERROR("rt7 currently requires a non-SMP ChibiOS configuration");
+		LOG_ERROR("chibios-rt7 currently requires a non-SMP ChibiOS configuration");
 		return ERROR_FAIL;
 	}
 
@@ -304,7 +304,7 @@ static int rt7_update_threads(struct rtos *rtos)
 	return ERROR_OK;
 
 corrupt:
-	LOG_ERROR("rt7 registry integrity check failed");
+	LOG_ERROR("chibios-rt7 registry integrity check failed");
 	retval = ERROR_FAIL;
 error:
 	rtos_free_threadlist(rtos);
@@ -357,13 +357,13 @@ static int rt7_get_thread_reg_list(struct rtos *rtos, int64_t thread_id,
 				context_size <= (int)minimum_size + 32 && (context_size - minimum_size) % 8 == 0)
 			return rtos_chibios_alt_get_thread_reg_list(rtos->target,
 					thread_id + signature.off_ctx, signature.intctxsize, reg_list, num_regs);
-		LOG_ERROR("Unsupported rt7 Cortex-M context layout");
+		LOG_ERROR("Unsupported chibios-rt7 Cortex-M context layout");
 		return ERROR_FAIL;
 	}
 	if (signature.intctxsize < 36 || (signature.intctxsize & 3) ||
 			(armv7m->arm.arch != ARM_ARCH_V6M && armv7m->arm.arch != ARM_ARCH_V7M &&
 			armv7m->arm.arch != ARM_ARCH_V8M)) {
-		LOG_ERROR("Unsupported rt7 Cortex-M context layout");
+		LOG_ERROR("Unsupported chibios-rt7 Cortex-M context layout");
 		return ERROR_FAIL;
 	}
 
@@ -390,7 +390,7 @@ static int rt7_get_thread_reg_list(struct rtos *rtos, int64_t thread_id,
 }
 
 const struct rtos_type rt7_rtos = {
-	.name = "rt7",
+	.name = "chibios-rt7",
 	.detect_rtos = rt7_detect,
 	.create = rt7_create,
 	.update_threads = rt7_update_threads,

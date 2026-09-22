@@ -18,7 +18,9 @@
 #include "server/gdb_server.h"
 
 static const struct rtos_type *rtos_types[] = {
-	// Keep in alphabetic order this list of rtos, except hwthread
+	/* Probe newer ChibiOS kernels before the legacy driver. */
+	&rt7_rtos,
+	// Keep the remaining RTOSes in alphabetic order, except hwthread
 	&chibios_rtos,
 	&chromium_ec_rtos,
 	&ecos_rtos,
@@ -28,7 +30,6 @@ static const struct rtos_type *rtos_types[] = {
 	&mqx_rtos,
 	&nuttx_rtos,
 	&riot_rtos,
-	&rt7_rtos,
 	&rtkernel_rtos,
 	&threadx_rtos,
 	&ucos_iii_rtos,
@@ -309,7 +310,7 @@ int rtos_qsymbol(struct connection *connection, char const *packet, int packet_s
 		goto done;
 	}
 
-	if (!next_sym->symbol_name) {
+	while (!next_sym->symbol_name) {
 		/* No more symbols need looking up */
 
 		if (!target->rtos_auto_detect) {
@@ -321,10 +322,19 @@ int rtos_qsymbol(struct connection *connection, char const *packet, int packet_s
 			LOG_INFO("Auto-detected RTOS: %s", os->type->name);
 			rtos_detected = 1;
 			goto done;
-		} else {
+		}
+
+		/* Symbols can be shared by different kernel versions. A failed
+		 * probe must advance just like a missing mandatory symbol does.
+		 */
+		if (!rtos_try_next(target)) {
 			LOG_WARNING("No RTOS could be auto-detected!");
 			goto done;
 		}
+		next_sym = next_symbol(os, "", 0);
+		next_suffix = no_suffix;
+		if (!next_sym)
+			goto done;
 	}
 
 	assert(next_suffix);

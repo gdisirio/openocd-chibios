@@ -5425,7 +5425,7 @@ The value should normally correspond to a static mapping for the
 @var{rtos_type} can be one of @option{auto}, @option{none}, @option{eCos},
 @option{ThreadX}, @option{FreeRTOS}, @option{linux}, @option{ChibiOS},
 @option{embKernel}, @option{mqx}, @option{uCOS-III}, @option{nuttx},
-@option{RIOT}, @option{Zephyr}, @option{rt7}, @option{rtkernel}
+@option{RIOT}, @option{Zephyr}, @option{chibios-rt7}, @option{rtkernel}
 @xref{gdbrtossupport,,RTOS Support}.
 
 @item @code{-defer-examine} -- skip target examination at initial JTAG chain
@@ -13572,7 +13572,7 @@ Currently supported rtos's include:
 @item @option{FreeRTOS}
 @item @option{linux}
 @item @option{ChibiOS}
-@item @option{rt7} (ChibiOS/RT kernel version 7)
+@item @option{chibios-rt7} (ChibiOS/RT kernel version 7)
 @item @option{embKernel}
 @item @option{mqx}
 @item @option{uCOS-III}
@@ -13606,7 +13606,7 @@ uxCurrentNumberOfTasks, uxTopUsedPriority, xSchedulerRunning.
 init_task.
 @item ChibiOS symbols
 rlist, ch_debug, chSysInit.
-@item rt7 symbols
+@item chibios-rt7 symbols
 ch_system, ch_debug.
 @item embKernel symbols
 Rtos::sCurrentTask, Rtos::sListReady, Rtos::sListSleep,
@@ -13633,18 +13633,19 @@ some, eg. FreeRTOS, uC/OS-III and Zephyr, extra steps must be taken.
 
 For ChibiOS/RT kernel version 7 (including ChibiOS 21.11.x), use:
 @example
-$_TARGETNAME configure -rtos rt7
+$_TARGETNAME configure -rtos chibios-rt7
 @end example
 Enable @code{CH_CFG_USE_REGISTRY} in @file{chconf.h} and retain the
 @code{ch_system} and @code{ch_debug} symbols in the executable loaded by GDB.
-The @option{rt7} driver reads the kernel's debugger layout record to locate
+The @option{chibios-rt7} driver reads the kernel's debugger layout record to locate
 the registry, current thread, thread names and saved contexts. It accepts
 kernel major version 7 only; @option{chibios} remains the driver for older
 kernels.
-Select @option{rt7} explicitly: @option{auto} can stop at the legacy
-@option{chibios} probe, which also requests @code{ch_debug}.
+With @option{auto}, @option{chibios-rt7} is probed first, before the legacy
+@option{chibios} driver. If its symbols are absent or its debugger layout
+is rejected, detection continues with the remaining RTOS drivers.
 
-The initial @option{rt7} implementation supports non-SMP configurations on
+The initial @option{chibios-rt7} implementation supports non-SMP configurations on
 @option{cortex_m} and @option{hla_target} targets using the standard ARMv6-M,
 ARMv7-M or ARMv8-M-ML ports. The callee-saved registers R4--R11, reconstructed
 stack pointer and resume address are available for suspended threads.
