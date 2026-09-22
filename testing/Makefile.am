@@ -2,3 +2,15 @@
 
 SUBDIRS = tcl_commands
 DIST_SUBDIRS = tcl_commands
+
+check_PROGRAMS = rt7-test
+TESTS = $(check_PROGRAMS)
+rt7_test_SOURCES = rtos/rt7.c $(top_srcdir)/src/rtos/rt7.c \
+	$(top_srcdir)/src/rtos/rtos_chibios_stackings_alt.c
+rt7_test_CPPFLAGS = -I$(top_srcdir)/src -I$(top_builddir)
+rt7_test_CFLAGS = $(GCC_WARNINGS)
+if INTERNAL_JIMTCL
+rt7_test_CPPFLAGS += -I$(top_srcdir)/jimtcl -I$(top_builddir)/jimtcl
+else
+rt7_test_CPPFLAGS += $(JIMTCL_CFLAGS)
+endif

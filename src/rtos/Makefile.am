@@ -6,6 +6,7 @@ noinst_LTLIBRARIES += %D%/librtos.la
 	%D%/rtos_standard_stackings.c \
 	%D%/rtos_ecos_stackings.c  \
 	%D%/rtos_chibios_stackings.c \
+	%D%/rtos_chibios_stackings_alt.c \
 	%D%/rtos_embkernel_stackings.c \
 	%D%/rtos_mqx_stackings.c \
 	%D%/rtos_ucos_iii_stackings.c \
@@ -16,6 +17,7 @@ noinst_LTLIBRARIES += %D%/librtos.la
 	%D%/ecos.c \
 	%D%/linux.c \
 	%D%/chibios.c \
+	%D%/rt7.c \
 	%D%/chromium-ec.c \
 	%D%/embkernel.c \
 	%D%/mqx.c \
@@ -30,6 +32,7 @@ noinst_LTLIBRARIES += %D%/librtos.la
 	%D%/rtos_ecos_stackings.h \
 	%D%/linux_header.h \
 	%D%/rtos_chibios_stackings.h \
+	%D%/rtos_chibios_stackings_alt.h \
 	%D%/rtos_embkernel_stackings.h \
 	%D%/rtos_mqx_stackings.h \
 	%D%/rtos_riot_stackings.h \
