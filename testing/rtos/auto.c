@@ -29,6 +29,7 @@ static const struct rtos_type *probed[16];
 static unsigned int probe_count;
 static unsigned int created;
 static unsigned int updated;
+static int register_result;
 int debug_level = LOG_LVL_ERROR;
 
 static bool probe(struct target *t)
@@ -52,7 +53,30 @@ static int update(struct rtos *rtos)
 	return ERROR_OK;
 }
 
-static int rt7_symbols(struct symbol_table_elem **symbols)
+static int get_registers(struct rtos *rtos, int64_t thread,
+		struct rtos_reg **registers, int *count)
+{
+	CHECK(thread == 2);
+	if (register_result != ERROR_OK)
+		return register_result;
+	*registers = calloc(1, sizeof(**registers));
+	CHECK(*registers);
+	*count = 1;
+	(*registers)->size = 32;
+	(*registers)->value[0] = 0x12;
+	return ERROR_OK;
+}
+
+static int get_register(struct rtos *rtos, int64_t thread,
+		uint32_t number, uint32_t *size, uint8_t **value)
+{
+	CHECK(thread == 2 && number == 17);
+	*size = 32;
+	*value = NULL;
+	return ERROR_OK;
+}
+
+static int chibios_symbols(struct symbol_table_elem **symbols)
 {
 	const struct symbol_table_elem list[] = {
 		{ "ch_system", 0, false }, { "ch_debug", 0, false }, { NULL, 0, false },
@@ -84,9 +108,15 @@ static int empty_symbols(struct symbol_table_elem **symbols)
 	return ERROR_OK;
 }
 
+const struct rtos_type rt8_rtos = {
+	.name = "chibios-rt8", .detect_rtos = probe, .create = create,
+	.update_threads = update, .get_symbol_list_to_lookup = chibios_symbols,
+	.get_thread_reg_list = get_registers,
+	.get_thread_reg_value = get_register,
+};
 const struct rtos_type rt7_rtos = {
 	.name = "chibios-rt7", .detect_rtos = probe, .create = create,
-	.update_threads = update, .get_symbol_list_to_lookup = rt7_symbols,
+	.update_threads = update, .get_symbol_list_to_lookup = chibios_symbols,
 };
 const struct rtos_type chibios_rtos = {
 	.name = "chibios", .detect_rtos = probe, .create = create,
@@ -190,19 +220,34 @@ static void finish_legacy(void)
 
 int main(void)
 {
-	/* RT7 must be first, including when its symbols have LTO suffixes. */
-	start(&rt7_rtos, "auto");
+	/* RT8 must be first, including when its symbols have LTO suffixes. */
+	start(&rt8_rtos, "auto");
 	answer("ch_system", true);
 	expect_symbol("ch_debug");
 	answer("ch_debug", false);
 	expect_symbol("ch_debug.lto_priv.0");
 	answer("ch_debug.lto_priv.0", true);
 	CHECK(!strcmp(reply, "OK") && !target.rtos_auto_detect);
-	CHECK(probe_count == 1 && probed[0] == &rt7_rtos);
+	CHECK(probe_count == 1 && probed[0] == &rt8_rtos);
 	CHECK(created == 1 && updated == 1);
 
-	/* A missing RT7 symbol must still allow legacy detection. */
+	/* RT7 follows RT8 when the kernel version is incompatible. */
+	start(&rt7_rtos, "auto");
+	answer("ch_system", true);
+	answer("ch_debug", true);
+	expect_symbol("ch_system");
+	answer("ch_system", true);
+	answer("ch_debug", true);
+	CHECK(!strcmp(reply, "OK") && !target.rtos_auto_detect);
+	CHECK(probe_count == 2 && probed[0] == &rt8_rtos && probed[1] == &rt7_rtos);
+	CHECK(created == 1 && updated == 1);
+
+	/* Missing RT8/RT7 symbols must still allow legacy detection. */
 	start(&chibios_rtos, "auto");
+	answer("ch_system", false);
+	expect_symbol("ch_system.lto_priv.0");
+	answer("ch_system.lto_priv.0", false);
+	expect_symbol("ch_system");
 	answer("ch_system", false);
 	expect_symbol("ch_system.lto_priv.0");
 	answer("ch_system.lto_priv.0", false);
@@ -214,8 +259,11 @@ int main(void)
 	start(&chibios_rtos, "auto");
 	answer("ch_system", true);
 	answer("ch_debug", true);
+	answer("ch_system", true);
+	answer("ch_debug", true);
 	finish_legacy();
-	CHECK(probe_count == 2 && probed[0] == &rt7_rtos && probed[1] == &chibios_rtos);
+	CHECK(probe_count == 3 && probed[0] == &rt8_rtos &&
+		probed[1] == &rt7_rtos && probed[2] == &chibios_rtos);
 	CHECK(target.rtos->type == &chibios_rtos && !target.rtos_auto_detect);
 	CHECK(created == 1 && updated == 1);
 
@@ -223,12 +271,16 @@ int main(void)
 	start(&ecos_rtos, "auto");
 	answer("ch_system", true);
 	answer("ch_debug", true);
+	answer("ch_system", true);
+	answer("ch_debug", true);
 	finish_legacy();
-	CHECK(probe_count == 4 && target.rtos->type == &ecos_rtos);
+	CHECK(probe_count == 5 && target.rtos->type == &ecos_rtos);
 	CHECK(!target.rtos_auto_detect && created == 1 && updated == 1);
 
 	/* Exhaustion ends the exchange without creating a rejected driver. */
 	start(NULL, "auto");
+	answer("ch_system", true);
+	answer("ch_debug", true);
 	answer("ch_system", true);
 	answer("ch_debug", true);
 	finish_legacy();
@@ -241,6 +293,26 @@ int main(void)
 	answer("ch_debug", true);
 	CHECK(!strcmp(reply, "OK") && !probe_count);
 	CHECK(created == 1 && updated == 1);
+	start(&rt8_rtos, "chibios-rt8");
+	answer("ch_system", true);
+	answer("ch_debug", true);
+	CHECK(!strcmp(reply, "OK") && !probe_count);
+	CHECK(created == 1 && updated == 1);
+	rtos_destroy(&target);
+
+	/* Only an unhandled read may fall back to the CPU's live registers. */
+	start(&rt8_rtos, "chibios-rt8");
+	target.rtos->current_thread = 1;
+	target.rtos->current_threadid = 1;
+	CHECK(rtos_get_gdb_reg_list(&connection) == ERROR_NOT_IMPLEMENTED);
+	target.rtos->current_threadid = 2;
+	register_result = ERROR_TARGET_FAILURE;
+	CHECK(rtos_get_gdb_reg_list(&connection) == ERROR_TARGET_FAILURE);
+	register_result = ERROR_OK;
+	CHECK(rtos_get_gdb_reg_list(&connection) == ERROR_OK);
+	CHECK(!strcmp(reply, "12000000"));
+	CHECK(rtos_get_gdb_reg(&connection, 17) == ERROR_OK);
+	CHECK(!strcmp(reply, "xxxxxxxx"));
 	rtos_destroy(&target);
 	return EXIT_SUCCESS;
 }

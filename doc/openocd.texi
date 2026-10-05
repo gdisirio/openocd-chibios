@@ -5425,7 +5425,7 @@ The value should normally correspond to a static mapping for the
 @var{rtos_type} can be one of @option{auto}, @option{none}, @option{eCos},
 @option{ThreadX}, @option{FreeRTOS}, @option{linux}, @option{ChibiOS},
 @option{embKernel}, @option{mqx}, @option{uCOS-III}, @option{nuttx},
-@option{RIOT}, @option{Zephyr}, @option{chibios-rt7}, @option{rtkernel}
+@option{RIOT}, @option{Zephyr}, @option{chibios-rt7}, @option{chibios-rt8}, @option{rtkernel}
 @xref{gdbrtossupport,,RTOS Support}.
 
 @item @code{-defer-examine} -- skip target examination at initial JTAG chain
@@ -13573,6 +13573,7 @@ Currently supported rtos's include:
 @item @option{linux}
 @item @option{ChibiOS}
 @item @option{chibios-rt7} (ChibiOS/RT kernel version 7)
+@item @option{chibios-rt8} (ChibiOS/RT kernel version 8)
 @item @option{embKernel}
 @item @option{mqx}
 @item @option{uCOS-III}
@@ -13608,6 +13609,8 @@ init_task.
 rlist, ch_debug, chSysInit.
 @item chibios-rt7 symbols
 ch_system, ch_debug.
+@item chibios-rt8 symbols
+ch_system, ch_debug.
 @item embKernel symbols
 Rtos::sCurrentTask, Rtos::sListReady, Rtos::sListSleep,
 Rtos::sListSuspended, Rtos::sMaxPriorities, Rtos::sCurrentTaskCount.
@@ -13641,9 +13644,10 @@ The @option{chibios-rt7} driver reads the kernel's debugger layout record to loc
 the registry, current thread, thread names and saved contexts. It accepts
 kernel major version 7 only; @option{chibios} remains the driver for older
 kernels.
-With @option{auto}, @option{chibios-rt7} is probed first, before the legacy
-@option{chibios} driver. If its symbols are absent or its debugger layout
-is rejected, detection continues with the remaining RTOS drivers.
+With @option{auto}, OpenOCD probes @option{chibios-rt8}, then
+@option{chibios-rt7}, then the legacy @option{chibios} driver. If symbols are
+absent or a debugger layout is rejected, detection continues with the
+remaining RTOS drivers.
 
 The initial @option{chibios-rt7} implementation supports non-SMP configurations on
 @option{cortex_m} and @option{hla_target} targets using the standard ARMv6-M,
@@ -13658,6 +13662,36 @@ with its hardware exception frame. The stack pointer accounts for basic
 or extended FPU frames and exception-stack alignment padding.
 Floating-point register values and modification of saved registers are
 not supported. The ARMv8-M-ML-TZ context layout is not supported.
+
+For ChibiOS/RT kernel version 8 with the redesigned debugger descriptor, use:
+@example
+$_TARGETNAME configure -rtos chibios-rt8
+@end example
+Enable @code{CH_CFG_USE_REGISTRY}, load the matching ELF in GDB and retain
+@code{ch_system} and @code{ch_debug}. With GCC section garbage collection or
+LTO, keep the descriptor using @code{-Wl,--undefined=ch_debug} at link time
+(@code{USE_LDOPT=--undefined=ch_debug} in ChibiOS makefiles).
+This driver reads scalar widths, object sizes, member offsets and the port
+context description from @code{ch_debug}; it requires neither DWARF types
+nor ChibiOS headers. It reports thread names, states, priorities and core IDs.
+Before kernel initialization it reports a single @samp{Current Execution}
+context.
+
+The initial @option{chibios-rt8} implementation supports a single initialized
+instance on @option{cortex_m} and @option{hla_target}. SMP target groups and
+shared SMP registries are not yet supported. Supported ports are ARMv6-M,
+ARMv6-M-ALT, ARMv7-M, ARMv7-M-ALT, ARMv8-M-ML and ARMv8-M-ML-ALT.
+Standard ports provide saved R4--R11, the reconstructed stack pointer and
+resume address; unsaved volatile core registers are reported as zero.
+ARMv7-M-ALT and ARMv8-M-ML-ALT also provide the hardware exception frame's
+core registers and account for extended FPU frames and alignment padding.
+Saved system and floating-point registers are available individually when
+the descriptor and saved context provide them. Lazy FPU stack reservations
+are reported as unavailable. Registers of the current thread come from
+the CPU; MSP always reflects the shared per-core exception stack.
+MPU context metadata is validated, but MPU region registers
+are not exposed as thread registers. Modification of saved registers,
+TrustZone, sandbox and non-Cortex-M ports are not supported.
 
 Zephyr must be compiled with the DEBUG_THREAD_INFO option. This will generate some symbols
 with information needed in order to build the list of threads.

@@ -3,7 +3,7 @@
 SUBDIRS = tcl_commands
 DIST_SUBDIRS = tcl_commands
 
-check_PROGRAMS = rt7-test rtos-auto-test
+check_PROGRAMS = rt7-test rt8-test rtos-auto-test
 TESTS = $(check_PROGRAMS)
 rt7_test_SOURCES = rtos/rt7.c $(top_srcdir)/src/rtos/rt7.c \
 	$(top_srcdir)/src/rtos/rtos_chibios_stackings_alt.c
@@ -14,6 +14,10 @@ rt7_test_CPPFLAGS += -I$(top_srcdir)/jimtcl -I$(top_builddir)/jimtcl
 else
 rt7_test_CPPFLAGS += $(JIMTCL_CFLAGS)
 endif
+
+rt8_test_SOURCES = rtos/rt8.c $(top_srcdir)/src/rtos/rt8.c
+rt8_test_CPPFLAGS = $(rt7_test_CPPFLAGS)
+rt8_test_CFLAGS = $(GCC_WARNINGS)
 
 rtos_auto_test_SOURCES = rtos/auto.c $(top_srcdir)/src/rtos/rtos.c \
 	$(top_srcdir)/src/helper/binarybuffer.c

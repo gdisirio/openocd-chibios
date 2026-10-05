@@ -19,6 +19,7 @@
 
 static const struct rtos_type *rtos_types[] = {
 	/* Probe newer ChibiOS kernels before the legacy driver. */
+	&rt8_rtos,
 	&rt7_rtos,
 	// Keep the remaining RTOSes in alphabetic order, except hwthread
 	&chibios_rtos,
@@ -527,7 +528,11 @@ static int rtos_put_gdb_reg(struct connection *connection,
 		return ERROR_FAIL;
 	}
 
-	size_t len = hexify(hex, reg_value, reg_bytes, num_bytes);
+	size_t len = reg_bytes * 2;
+	if (reg_value)
+		len = hexify(hex, reg_value, reg_bytes, num_bytes);
+	else
+		memset(hex, 'x', len);
 
 	gdb_put_packet(connection, hex, len);
 	free(hex);
@@ -641,12 +646,12 @@ int rtos_get_gdb_reg_list(struct connection *connection)
 			return retval;
 		}
 
-		rtos_put_gdb_reg_list(connection, reg_list, num_regs);
+		retval = rtos_put_gdb_reg_list(connection, reg_list, num_regs);
 		free(reg_list);
 
-		return ERROR_OK;
+		return retval;
 	}
-	return ERROR_FAIL;
+	return ERROR_NOT_IMPLEMENTED;
 }
 
 int rtos_set_reg(struct connection *connection, int reg_num,

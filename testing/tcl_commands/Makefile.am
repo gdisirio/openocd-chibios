@@ -4,6 +4,7 @@ TESTS =
 
 if DUMMY
 TESTS += \
+	test-rt8-command.cfg \
 	test-rt7-command.cfg \
 	test-target-create-command.cfg \
 	test-target-configure-cget-command.cfg \

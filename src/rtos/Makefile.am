@@ -18,6 +18,7 @@ noinst_LTLIBRARIES += %D%/librtos.la
 	%D%/linux.c \
 	%D%/chibios.c \
 	%D%/rt7.c \
+	%D%/rt8.c \
 	%D%/chromium-ec.c \
 	%D%/embkernel.c \
 	%D%/mqx.c \

@@ -66,7 +66,8 @@ struct rtos_type {
 	int (*get_thread_reg_list)(struct rtos *rtos, int64_t thread_id,
 			struct rtos_reg **reg_list, int *num_regs);
 	/** Return the size and value of the specified reg_num. The value is
-	 * allocated by the callee and freed by the caller. */
+	 * allocated by the callee and freed by the caller. A NULL value with
+	 * a nonzero size means the register is unavailable in this context. */
 	int (*get_thread_reg_value)(struct rtos *rtos, threadid_t thread_id,
 			uint32_t reg_num, uint32_t *size, uint8_t **value);
 	int (*get_symbol_list_to_lookup)(struct symbol_table_elem *symbol_list[]);
@@ -172,6 +173,7 @@ extern const struct rtos_type mqx_rtos;
 extern const struct rtos_type nuttx_rtos;
 extern const struct rtos_type riot_rtos;
 extern const struct rtos_type rt7_rtos;
+extern const struct rtos_type rt8_rtos;
 extern const struct rtos_type rtkernel_rtos;
 extern const struct rtos_type threadx_rtos;
 extern const struct rtos_type ucos_iii_rtos;

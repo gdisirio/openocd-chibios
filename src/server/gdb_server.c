@@ -1299,8 +1299,13 @@ static int gdb_get_registers_packet(struct connection *connection,
 	LOG_DEBUG("-");
 #endif
 
-	if ((target->rtos) && (rtos_get_gdb_reg_list(connection) == ERROR_OK))
-		return ERROR_OK;
+	if (target->rtos) {
+		retval = rtos_get_gdb_reg_list(connection);
+		if (retval == ERROR_OK)
+			return ERROR_OK;
+		if (retval != ERROR_NOT_IMPLEMENTED)
+			return gdb_error(connection, retval);
+	}
 
 	retval = target_get_gdb_reg_list(target, &reg_list, &reg_list_size,
 			REG_CLASS_GENERAL);
