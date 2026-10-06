@@ -2305,15 +2305,13 @@ void target_quit(void)
 	}
 	target_timer_callbacks = NULL;
 
-	for (struct target *target = all_targets; target;) {
-		struct target *tmp;
-
-		tmp = target->next;
+	while (all_targets) {
+		struct target *target = all_targets;
+		struct target *next = target->next;
 		target_destroy(target);
-		target = tmp;
+		/* RTOS teardown of later targets must not visit freed objects. */
+		all_targets = next;
 	}
-
-	all_targets = NULL;
 }
 
 int target_arch_state(struct target *target)

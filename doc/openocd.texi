@@ -13677,9 +13677,8 @@ nor ChibiOS headers. It reports thread names, states, priorities and core IDs.
 Before kernel initialization it reports a single @samp{Current Execution}
 context.
 
-The initial @option{chibios-rt8} implementation supports a single initialized
-instance on @option{cortex_m} and @option{hla_target}. SMP target groups and
-shared SMP registries are not yet supported. Supported ports are ARMv6-M,
+The @option{chibios-rt8} implementation supports a single initialized
+instance on @option{cortex_m} and @option{hla_target}. Supported ports are ARMv6-M,
 ARMv6-M-ALT, ARMv7-M, ARMv7-M-ALT, ARMv8-M-ML and ARMv8-M-ML-ALT.
 Standard ports provide saved R4--R11, the reconstructed stack pointer and
 resume address; unsaved volatile core registers are reported as zero.
@@ -13692,6 +13691,36 @@ the CPU; MSP always reflects the shared per-core exception stack.
 MPU context metadata is validated, but MPU region registers
 are not exposed as thread registers. Modification of saved registers,
 TrustZone, sandbox and non-Cortex-M ports are not supported.
+
+Experimental SMP support is available for @option{cortex_m} targets running
+one shared firmware image on cores with the same architecture, byte order
+and floating-point register support. Both a shared registry and separate
+instance registries within that image are supported. Configure
+@option{chibios-rt8} explicitly before creating the SMP group; RTOS
+auto-detection is not supported for this mode. Set each target's
+@option{-coreid} to its ChibiOS core ID, independently of target list order:
+@example
+# After creating the two Cortex-M targets:
+chip.cpu0 configure -coreid 0 -rtos chibios-rt8
+chip.cpu1 configure -coreid 1 -rtos chibios-rt8
+target smp chip.cpu0 chip.cpu1
+@end example
+Connect GDB to the group's single GDB port and load the shared ELF. The
+group shares symbol lookup, thread selection and a combined thread list.
+Every configured core must be examined and halted before the driver reads
+kernel state, including cores whose kernel instance is not initialized yet.
+Live threads use their own CPU registers; suspended threads use saved
+contexts, with MSP read from their owning core. Single-stepping a live
+thread selects its CPU. Suspended threads retain OpenOCD's fake-step
+behaviour and reject register writes. Software breakpoints use shared code
+memory; hardware breakpoints and coordinated halt/resume use OpenOCD's
+Cortex-M SMP backend.
+
+This SMP implementation has host regression coverage but has not been
+validated on multicore hardware. Separate firmware images, heterogeneous
+cores and non-stop debugging are outside its scope. Halting inside a kernel
+context switch can expose transitional scheduler state; registry checks
+cannot guarantee that a snapshot taken there represents a completed switch.
 
 Zephyr must be compiled with the DEBUG_THREAD_INFO option. This will generate some symbols
 with information needed in order to build the list of threads.

@@ -1397,7 +1397,15 @@ static int gdb_set_registers_packet(struct connection *connection,
 		bin_buf = malloc(DIV_ROUND_UP(reg_list[i]->size, 8));
 		gdb_target_to_reg(target, packet_p, chars, bin_buf);
 
-		retval = reg_list[i]->type->set(reg_list[i], bin_buf);
+		retval = target->rtos ? rtos_set_reg(connection, reg_list[i]->number, bin_buf) :
+			ERROR_NOT_IMPLEMENTED;
+		if (retval == ERROR_NOT_IMPLEMENTED)
+			retval = reg_list[i]->type->set(reg_list[i], bin_buf);
+		else if (retval != ERROR_OK) {
+			free(reg_list);
+			free(bin_buf);
+			return gdb_error(connection, retval);
+		}
 		if (retval != ERROR_OK && gdb_report_register_access_error) {
 			LOG_DEBUG("Couldn't set register %s.", reg_list[i]->name);
 			free(reg_list);
@@ -1492,13 +1500,6 @@ static int gdb_set_register_packet(struct connection *connection,
 	uint8_t *bin_buf = malloc(chars / 2);
 	gdb_target_to_reg(target, separator + 1, chars, bin_buf);
 
-	if ((target->rtos) &&
-			(rtos_set_reg(connection, reg_num, bin_buf) == ERROR_OK)) {
-		free(bin_buf);
-		gdb_put_packet(connection, "OK", 2);
-		return ERROR_OK;
-	}
-
 	retval = target_get_gdb_reg_list_noread(target, &reg_list, &reg_list_size,
 			REG_CLASS_ALL);
 	if (retval != ERROR_OK) {
@@ -1524,7 +1525,14 @@ static int gdb_set_register_packet(struct connection *connection,
 
 	gdb_target_to_reg(target, separator + 1, chars, bin_buf);
 
-	retval = reg_list[reg_num]->type->set(reg_list[reg_num], bin_buf);
+	retval = target->rtos ? rtos_set_reg(connection, reg_num, bin_buf) : ERROR_NOT_IMPLEMENTED;
+	if (retval == ERROR_NOT_IMPLEMENTED)
+		retval = reg_list[reg_num]->type->set(reg_list[reg_num], bin_buf);
+	else if (retval != ERROR_OK) {
+		free(bin_buf);
+		free(reg_list);
+		return gdb_error(connection, retval);
+	}
 	if (retval != ERROR_OK && gdb_report_register_access_error) {
 		LOG_DEBUG("Couldn't set register %s.", reg_list[reg_num]->name);
 		free(bin_buf);

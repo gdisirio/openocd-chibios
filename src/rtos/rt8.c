@@ -10,6 +10,8 @@
 #include "helper/types.h"
 #include "target/armv7m.h"
 #include "target/register.h"
+#include "target/smp.h"
+#include "server/gdb_server.h"
 
 /* RT8's binary descriptor is independent of host C structure layout.
  * The kernel version selects this format; neither DWARF nor kernel headers
@@ -281,15 +283,32 @@ static int rt8_snapshot(struct rtos *rtos, struct rt8_snapshot *snapshot)
 	int retval;
 
 	snapshot->count = 0;
+	if (target->state != TARGET_HALTED)
+		return ERROR_TARGET_NOT_HALTED;
+	/* A shared registry is meaningful only while every core is stopped.
+	 * Even a core without a published instance may be initializing it. */
+	if (target->smp) {
+		struct target_list *head;
+		if (!target->smp_targets || list_empty(target->smp_targets))
+			return ERROR_FAIL;
+		foreach_smp_target(head, target->smp_targets) {
+			struct target *cpu = head->target;
+			if (cpu->rtos != rtos || strcmp(target_type_name(cpu), "cortex_m") ||
+					cpu->endianness != target->endianness || !target_was_examined(cpu))
+				return ERROR_FAIL;
+			if (cpu->state != TARGET_HALTED)
+				return ERROR_TARGET_NOT_HALTED;
+			if (!is_armv7m(target_to_armv7m(cpu)) ||
+					target_to_armv7m(cpu)->arm.arch != target_to_armv7m(target)->arm.arch ||
+					target_to_armv7m(cpu)->fp_feature != target_to_armv7m(target)->fp_feature)
+				return ERROR_FAIL;
+		}
+	}
 	retval = rt8_read_layout(rtos, &snapshot->layout);
 	if (retval != ERROR_OK)
 		return retval;
-	if (target->state != TARGET_HALTED)
-		return ERROR_TARGET_NOT_HALTED;
-	/* Keep shared/per-instance layout decoding separate from target/core
-	 * mapping so SMP support can be added without changing the ABI parser. */
-	if (target->smp || (snapshot->layout.flags & RT8_SMP)) {
-		LOG_ERROR("chibios-rt8 currently requires a single-core, non-SMP configuration");
+	if (!target->smp && (snapshot->layout.flags & RT8_SMP)) {
+		LOG_ERROR("chibios-rt8 shared registry requires a configured SMP target group");
 		return ERROR_FAIL;
 	}
 	retval = rt8_read_uint(target, rtos->symbols[RT8_CH_SYSTEM].address + f[RT8_SYS_STATE],
@@ -320,7 +339,21 @@ static int rt8_snapshot(struct rtos *rtos, struct rt8_snapshot *snapshot)
 			return ERROR_FAIL;
 		instance->core = core;
 		instance->target = target;
-		if (snapshot->count) {
+		if (target->smp) {
+			struct target_list *head;
+			instance->target = NULL;
+			foreach_smp_target(head, target->smp_targets) {
+				if (head->target->coreid != (int32_t)core)
+					continue;
+				if (instance->target)
+					return ERROR_FAIL;
+				instance->target = head->target;
+			}
+			if (!instance->target) {
+				LOG_ERROR("chibios-rt8 has no target for core %" PRIu64, core);
+				return ERROR_FAIL;
+			}
+		} else if (snapshot->count) {
 			LOG_ERROR("chibios-rt8 currently supports only one initialized instance");
 			return ERROR_FAIL;
 		}
@@ -357,6 +390,31 @@ static struct target *rt8_live_target(const struct rt8_snapshot *snapshot, threa
 		if (snapshot->instances[i].current == thread)
 			return snapshot->instances[i].target;
 	return NULL;
+}
+
+static struct target *rt8_owner_target(struct rtos *rtos,
+		const struct rt8_snapshot *snapshot, threadid_t thread)
+{
+	uint32_t owner;
+	if (rt8_read_pointer(rtos->target, thread + snapshot->layout.field[RT8_THREAD_OWNER],
+			&owner) != ERROR_OK)
+		return NULL;
+	for (unsigned int i = 0; i < snapshot->count; i++)
+		if (snapshot->instances[i].address == owner)
+			return snapshot->instances[i].target;
+	return NULL;
+}
+
+static unsigned int rt8_stop_priority(struct target *target)
+{
+	switch (target->debug_reason) {
+	case DBG_REASON_SINGLESTEP: return 4;
+	case DBG_REASON_BREAKPOINT: return 3;
+	case DBG_REASON_WATCHPOINT:
+	case DBG_REASON_WPTANDBKPT: return 2;
+	case DBG_REASON_DBGRQ: return 1;
+	default: return 0;
+	}
 }
 
 static int rt8_add_thread(struct rtos *rtos, const struct rt8_snapshot *snapshot,
@@ -495,7 +553,12 @@ static int rt8_update_threads(struct rtos *rtos)
 			retval = ERROR_FAIL;
 			goto error;
 		}
-		if (snapshot.instances[i].target == rtos->target)
+		unsigned int priority = rt8_stop_priority(snapshot.instances[i].target);
+		unsigned int best = rt8_stop_priority(snapshot.instances[current].target);
+		if (priority > best || (priority == best &&
+				(snapshot.instances[i].current == selected ||
+				(snapshot.instances[current].current != selected &&
+				snapshot.instances[i].target == rtos->target))))
 			current = i;
 	}
 	rtos->current_thread = snapshot.instances[current].current;
@@ -715,8 +778,11 @@ static int rt8_get_thread_reg_value(struct rtos *rtos, int64_t thread,
 		live = rtos->target;
 	/* These ports switch PSP; MSP is the shared per-core exception stack,
 	 * which GDB also needs when unwinding through the startup frame. */
-	if (number == ARMV7M_MSP)
-		live = rtos->target;
+	if (number == ARMV7M_MSP && !live) {
+		live = rt8_owner_target(rtos, &snapshot, thread);
+		if (!live)
+			return ERROR_FAIL;
+	}
 	if (live) {
 		reg = register_get_by_number(live->reg_cache, number, true);
 		if (!reg || !reg->exist || reg->hidden || reg->size > sizeof(data) * 8)
@@ -777,16 +843,21 @@ static int rt8_get_thread_reg_value(struct rtos *rtos, int64_t thread,
 					goto unavailable;
 				/* Reserved lazy-stack space is not a saved floating-point
 				 * context. Do not expose its previous memory contents. */
-				uint32_t fpccr, fpcar;
-				retval = rt8_read_pointer(rtos->target, 0xe000ef34, &fpccr);
-				if (retval != ERROR_OK)
-					return retval;
-				if (fpccr & BIT(0)) {
-					retval = rt8_read_pointer(rtos->target, 0xe000ef38, &fpcar);
+				/* A pending lazy save can belong to any core, even if the
+				 * scheduler has already changed the thread's owner. */
+				for (unsigned int i = 0; i < snapshot.count; i++) {
+					uint32_t fpccr, fpcar;
+					struct target *cpu = snapshot.instances[i].target;
+					retval = rt8_read_pointer(cpu, 0xe000ef34, &fpccr);
 					if (retval != ERROR_OK)
 						return retval;
-					if (fpcar >= context.frame && fpcar < context.sp)
-						goto unavailable;
+					if (fpccr & BIT(0)) {
+						retval = rt8_read_pointer(cpu, 0xe000ef38, &fpcar);
+						if (retval != ERROR_OK)
+							return retval;
+						if (fpcar >= context.frame && fpcar < context.sp)
+							goto unavailable;
+					}
 				}
 				address = context.frame + (number == ARMV7M_FPSCR ? p[RT8_FRAME_FPSCR] :
 					p[RT8_FRAME_S0] + 8 * (number - ARMV7M_D0));
@@ -823,12 +894,144 @@ unavailable:
 	return ERROR_OK;
 }
 
+static int rt8_target_for_threadid(struct connection *connection, int64_t thread,
+		struct target **result)
+{
+	struct target *target = get_target_from_connection(connection);
+	struct rtos *rtos = target->rtos;
+	struct rt8_snapshot snapshot;
+
+	/* Several GDB callers ignore errors from this callback. Always provide
+	 * a usable target, including Ctrl-C while the CPUs are still running. */
+	*result = target;
+	if (!rtos || !target->smp || target->state != TARGET_HALTED)
+		return ERROR_OK;
+	/* GDB sends Hg0 before offering qSymbol during attachment. */
+	if (thread <= 0 && !rtos->current_thread)
+		return ERROR_OK;
+	if (thread <= 0)
+		thread = rtos->current_thread;
+	int retval = rt8_snapshot(rtos, &snapshot);
+	if (retval != ERROR_OK)
+		return retval;
+	if (!snapshot.count && thread == 1) {
+		*result = rtos->target;
+		return ERROR_OK;
+	}
+	if (rt8_find_thread(rtos, thread) < 0)
+		return ERROR_FAIL;
+	struct target *live = rt8_live_target(&snapshot, thread);
+	if (live)
+		*result = live;
+	return ERROR_OK;
+}
+
+static bool rt8_needs_fake_step(struct target *target, int64_t thread)
+{
+	struct rtos *rtos = target->rtos;
+	struct rt8_snapshot snapshot;
+	if (!target->smp)
+		return thread != rtos->current_thread;
+	if (thread <= 0 && !rtos->current_thread)
+		return false;
+	if (thread <= 0)
+		thread = rtos->current_thread;
+	if (rt8_find_thread(rtos, thread) < 0 || rt8_snapshot(rtos, &snapshot) != ERROR_OK)
+		return true;
+	return !rt8_live_target(&snapshot, thread) && (snapshot.count || thread != 1);
+}
+
+static int rt8_thread_packet(struct connection *connection, const char *packet, int size)
+{
+	struct target *target = get_target_from_connection(connection);
+	if (target->smp && size > 2 && packet[0] == 'H' && packet[1] == 'g') {
+		threadid_t thread;
+		struct target *cpu;
+		if (sscanf(packet + 2, "%16" SCNx64, &thread) != 1 ||
+				rt8_target_for_threadid(connection, thread, &cpu) != ERROR_OK) {
+			gdb_put_packet(connection, "E01", 3);
+			return ERROR_OK;
+		}
+		/* GDB's ordinary CPU operations must follow selection of a live
+		 * thread on either core. Suspended contexts remain read-only. */
+		struct gdb_service *service = connection->service->priv;
+		service->target = cpu;
+	}
+	return rtos_thread_packet(connection, packet, size);
+}
+
+static int rt8_set_reg(struct rtos *rtos, uint32_t number, uint8_t *value)
+{
+	struct rt8_snapshot snapshot;
+	int retval = rt8_snapshot(rtos, &snapshot);
+	if (retval != ERROR_OK)
+		return retval;
+	struct target *live = rt8_live_target(&snapshot, rtos->current_threadid);
+	if (!snapshot.count && rtos->current_threadid == 1)
+		live = rtos->target;
+	/* Never let GDB fall back to writing a CPU when a saved thread context
+	 * was selected. Only live threads support register modification. */
+	if (!live || rt8_find_thread(rtos, rtos->current_threadid) < 0)
+		return ERROR_FAIL;
+	struct reg *reg = register_get_by_number(live->reg_cache, number, true);
+	if (!reg || !reg->exist || reg->hidden || !reg->type || !reg->type->set)
+		return ERROR_FAIL;
+	retval = reg->type->set(reg, value);
+	return retval == ERROR_NOT_IMPLEMENTED ? ERROR_FAIL : retval;
+}
+
+static struct target *rt8_swbp_target(struct rtos *rtos, target_addr_t address,
+		uint32_t length, enum breakpoint_type type)
+{
+	/* Shared code memory: keep software breakpoints on a stable target even
+	 * when GDB changes its selected core. Hardware breakpoints use the group. */
+	return rtos->target;
+}
+
+static int rt8_smp_init(struct target *target)
+{
+	struct target_list *head, *other;
+	struct rtos *rtos = target->rtos;
+	unsigned int count = 0;
+
+	/* Called during configuration, before examination or symbol lookup. */
+	foreach_smp_target(head, target->smp_targets) {
+		struct target *cpu = head->target;
+		if (strcmp(target_type_name(cpu), "cortex_m") || cpu->coreid < 0 ||
+				cpu->rtos_auto_detect || (cpu->rtos && cpu->rtos->type != &rt8_rtos) ||
+				++count > RT8_MAX_INSTANCES) {
+			LOG_ERROR("chibios-rt8 SMP requires Cortex-M targets with explicit RTOS selection");
+			return ERROR_FAIL;
+		}
+		foreach_smp_target(other, target->smp_targets) {
+			if (other != head && other->target->coreid == cpu->coreid) {
+				LOG_ERROR("chibios-rt8 SMP requires unique -coreid values matching ChibiOS core IDs");
+				return ERROR_FAIL;
+			}
+		}
+	}
+	if (!count)
+		return ERROR_FAIL;
+	/* One firmware image and one GDB connection share symbols, selection
+	 * and the thread list. Free independent objects before attaching aliases. */
+	foreach_smp_target(head, target->smp_targets) {
+		if (head->target->rtos != rtos)
+			rtos_destroy(head->target);
+	}
+	foreach_smp_target(head, target->smp_targets)
+		head->target->rtos = rtos;
+	LOG_WARNING("chibios-rt8 SMP support is experimental and has not been hardware validated");
+	return ERROR_OK;
+}
+
 static int rt8_create(struct target *target)
 {
 	if (!rt8_target_supported(target)) {
 		LOG_ERROR("chibios-rt8 does not support target type %s", target_type_name(target));
 		return ERROR_FAIL;
 	}
+	target->rtos->gdb_target_for_threadid = rt8_target_for_threadid;
+	target->rtos->gdb_thread_packet = rt8_thread_packet;
 	return ERROR_OK;
 }
 
@@ -845,8 +1048,12 @@ const struct rtos_type rt8_rtos = {
 	.name = "chibios-rt8",
 	.detect_rtos = rt8_detect,
 	.create = rt8_create,
+	.smp_init = rt8_smp_init,
 	.update_threads = rt8_update_threads,
 	.get_thread_reg_list = rt8_get_thread_reg_list,
 	.get_thread_reg_value = rt8_get_thread_reg_value,
 	.get_symbol_list_to_lookup = rt8_get_symbols,
+	.set_reg = rt8_set_reg,
+	.needs_fake_step = rt8_needs_fake_step,
+	.swbp_target = rt8_swbp_target,
 };

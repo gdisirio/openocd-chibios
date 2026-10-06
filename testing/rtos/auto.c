@@ -20,6 +20,7 @@
 } while (0)
 
 static struct target target;
+struct target *all_targets = &target;
 static struct gdb_service gdb_service = { .target = &target };
 static struct service service = { .priv = &gdb_service };
 static struct connection connection = { .service = &service };
@@ -306,6 +307,7 @@ int main(void)
 	target.rtos->current_threadid = 1;
 	CHECK(rtos_get_gdb_reg_list(&connection) == ERROR_NOT_IMPLEMENTED);
 	target.rtos->current_threadid = 2;
+	CHECK(rtos_set_reg(&connection, 17, NULL) == ERROR_NOT_IMPLEMENTED);
 	register_result = ERROR_TARGET_FAILURE;
 	CHECK(rtos_get_gdb_reg_list(&connection) == ERROR_TARGET_FAILURE);
 	register_result = ERROR_OK;

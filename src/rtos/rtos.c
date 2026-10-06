@@ -81,6 +81,12 @@ static void os_free(struct target *target)
 	if (!target->rtos)
 		return;
 
+	/* SMP drivers may share one RTOS object. Detach all aliases, even if
+	 * the group has since been dismantled or one member is reconfigured. */
+	for (struct target *cpu = all_targets; cpu; cpu = cpu->next) {
+		if (cpu != target && cpu->rtos == target->rtos)
+			cpu->rtos = NULL;
+	}
 	free(target->rtos->symbols);
 	rtos_free_threadlist(target->rtos);
 	free(target->rtos);
@@ -665,7 +671,7 @@ int rtos_set_reg(struct connection *connection, int reg_num,
 			(current_threadid != 0)) {
 		return target->rtos->type->set_reg(target->rtos, reg_num, reg_value);
 	}
-	return ERROR_FAIL;
+	return ERROR_NOT_IMPLEMENTED;
 }
 
 int rtos_generic_stack_read(struct target *target,

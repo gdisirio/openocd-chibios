@@ -73,6 +73,8 @@ struct rtos_type {
 	int (*get_symbol_list_to_lookup)(struct symbol_table_elem *symbol_list[]);
 	int (*clean)(struct target *target);
 	char * (*ps_command)(struct target *target);
+	/* ERROR_NOT_IMPLEMENTED permits a live-CPU fallback. Any other failure
+	 * must be reported to GDB without modifying the CPU's registers. */
 	int (*set_reg)(struct rtos *rtos, uint32_t reg_num, uint8_t *reg_value);
 	/* Implement these if different threads in the RTOS can see memory
 	 * differently (for instance because address translation might be different

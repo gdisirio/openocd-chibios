@@ -9,6 +9,8 @@
 #include "target/armv7m.h"
 #include "target/register.h"
 #include "target/target_type.h"
+#include "target/smp.h"
+#include "server/gdb_server.h"
 
 /* Independent byte-level RT8 fixtures. No driver layout types are imported. */
 #define CHECK(expr) do { \
@@ -21,6 +23,7 @@
 enum {
 	SIGNATURE = 0x100, SYSTEM = 0x300, INSTANCE = 0x400,
 	MAIN_THREAD = 0x800, WORKER_THREAD = 0xc00, STACK = 0x2200,
+	SECOND_INSTANCE = 0x1000, SECOND_THREAD = 0x1400, SHARED_REGISTRY = SYSTEM + 48,
 	REGISTRY = INSTANCE + 512, NODE = 320, NONE = 0xffff,
 };
 
@@ -31,13 +34,77 @@ static uint32_t fpccr, fpcar;
 static struct target_type target_type = { .name = "cortex_m" };
 static struct armv7m_common armv7m;
 static struct target target;
-static struct rtos rtos;
+struct target *all_targets = &target;
+static struct rtos *rt8_os;
+static struct target secondary;
+static struct armv7m_common secondary_arm;
+static struct reg_cache caches[2];
+static struct reg secondary_regs[ARMV7M_NUM_CORE_REGS];
+static uint8_t secondary_values[ARMV7M_NUM_CORE_REGS][4];
+static uint8_t secondary_msp[4];
+static struct reg secondary_msp_reg = {
+	.size = 32, .value = secondary_msp, .exist = true, .valid = true,
+};
+static uint32_t secondary_fpccr, secondary_fpcar;
+static struct list_head smp_targets;
+static struct target_list members[2];
+static struct gdb_service gdb_service;
+static struct service service = { .priv = &gdb_service };
+static struct connection connection = { .service = &service };
+static char reply[GDB_BUFFER_SIZE + 1];
+int debug_level = LOG_LVL_ERROR;
+
+/* Only RT8 is used; the real RTOS framework still references other drivers. */
+#define EMPTY_RTOS(symbol) const struct rtos_type symbol = { .name = #symbol }
+EMPTY_RTOS(rt7_rtos);
+EMPTY_RTOS(chibios_rtos);
+EMPTY_RTOS(chromium_ec_rtos);
+EMPTY_RTOS(ecos_rtos);
+EMPTY_RTOS(embkernel_rtos);
+EMPTY_RTOS(freertos_rtos);
+EMPTY_RTOS(linux_rtos);
+EMPTY_RTOS(mqx_rtos);
+EMPTY_RTOS(nuttx_rtos);
+EMPTY_RTOS(riot_rtos);
+EMPTY_RTOS(rtkernel_rtos);
+EMPTY_RTOS(threadx_rtos);
+EMPTY_RTOS(ucos_iii_rtos);
+EMPTY_RTOS(zephyr_rtos);
+EMPTY_RTOS(hwthread_rtos);
+
+void command_print(struct command_invocation *cmd, const char *format, ...)
+{
+}
+
+int gdb_put_packet(struct connection *conn, const char *buffer, int len)
+{
+	CHECK(len >= 0 && (size_t)len < sizeof(reply));
+	memcpy(reply, buffer, len);
+	reply[len] = '\0';
+	return ERROR_OK;
+}
 static struct reg live_regs[ARMV7M_NUM_CORE_REGS];
 static uint8_t live_values[ARMV7M_NUM_CORE_REGS][4];
 static uint8_t msp_value[4];
 static struct reg msp_reg = { .size = 32, .value = msp_value, .exist = true, .valid = true };
 static struct reg other_reg = { .size = 32, .exist = true };
 static unsigned int cases;
+
+static unsigned int writes;
+static int write_result;
+static struct reg *written_reg;
+
+static int set_register(struct reg *reg, uint8_t *value)
+{
+	writes++;
+	written_reg = reg;
+	if (write_result != ERROR_OK)
+		return write_result;
+	memcpy(reg->value, value, DIV_ROUND_UP(reg->size, 8));
+	return ERROR_OK;
+}
+
+static const struct reg_arch_type reg_type = { .set = set_register };
 
 static void put_u32(uint32_t address, uint32_t value)
 {
@@ -64,11 +131,11 @@ int target_read_buffer(struct target *t, target_addr_t address, uint32_t size, u
 {
 	CHECK(++reads < 100000);
 	if (address == 0xe000ef34 && size == 4) {
-		target_buffer_set_u32(t, buffer, fpccr);
+		target_buffer_set_u32(t, buffer, t == &secondary ? secondary_fpccr : fpccr);
 		return ERROR_OK;
 	}
 	if (address == 0xe000ef38 && size == 4) {
-		target_buffer_set_u32(t, buffer, fpcar);
+		target_buffer_set_u32(t, buffer, t == &secondary ? secondary_fpcar : fpcar);
 		return ERROR_OK;
 	}
 	if (!address || address > sizeof(memory) || size > sizeof(memory) - address ||
@@ -147,19 +214,6 @@ char *alloc_printf(const char *format, ...)
 	return result < 0 ? NULL : text;
 }
 
-void rtos_free_threadlist(struct rtos *os)
-{
-	for (int i = 0; i < os->thread_count; i++) {
-		free(os->thread_details[i].thread_name_str);
-		free(os->thread_details[i].extra_info_str);
-	}
-	free(os->thread_details);
-	os->thread_details = NULL;
-	os->thread_count = 0;
-	os->current_thread = 0;
-	os->current_threadid = -1;
-}
-
 int target_get_gdb_reg_list(struct target *t, struct reg ***list, int *count,
 		enum target_register_class reg_class)
 {
@@ -167,16 +221,16 @@ int target_get_gdb_reg_list(struct target *t, struct reg ***list, int *count,
 	*list = calloc(*count, sizeof(**list));
 	CHECK(*list);
 	for (int i = 0; i < *count; i++)
-		(*list)[i] = &live_regs[i];
+		(*list)[i] = t == &secondary ? &secondary_regs[i] : &live_regs[i];
 	return ERROR_OK;
 }
 
 struct reg *register_get_by_number(struct reg_cache *cache, uint32_t number, bool all)
 {
 	if (number < ARMV7M_NUM_CORE_REGS)
-		return &live_regs[number];
+		return cache == &caches[1] ? &secondary_regs[number] : &live_regs[number];
 	if (number == ARMV7M_MSP)
-		return &msp_reg;
+		return cache == &caches[1] ? &secondary_msp_reg : &msp_reg;
 	if (number >= ARMV7M_LAST_REG)
 		return NULL;
 	other_reg.size = number >= ARMV7M_D0 && number <= ARMV7M_D15 ? 64 : 32;
@@ -185,8 +239,9 @@ struct reg *register_get_by_number(struct reg_cache *cache, uint32_t number, boo
 
 static void teardown(void)
 {
-	rtos_free_threadlist(&rtos);
-	free(rtos.symbols);
+	rtos_destroy(&target);
+	rtos_destroy(&secondary);
+	rt8_os = NULL;
 }
 
 static unsigned int setup(unsigned int port, bool fpu, bool control, bool mpu,
@@ -223,9 +278,20 @@ static unsigned int setup(unsigned int port, bool fpu, bool control, bool mpu,
 
 	memset(memory, 0, sizeof(memory));
 	memset(&target, 0, sizeof(target));
-	memset(&rtos, 0, sizeof(rtos));
+	memset(&secondary, 0, sizeof(secondary));
+	target.next = &secondary;
+	INIT_LIST_HEAD(&smp_targets);
+	target.smp_targets = &smp_targets;
+	secondary.smp_targets = &smp_targets;
+	target.reg_cache = &caches[0];
+	secondary_fpccr = 0;
+	secondary_fpcar = 0;
+	gdb_service.target = &target;
 	memset(&armv7m, 0, sizeof(armv7m));
 	reads = 0;
+	writes = 0;
+	write_result = ERROR_OK;
+	written_reg = NULL;
 	read_fault = 0;
 	fpccr = fpcar = 0;
 	armv7m.common_magic = ARMV7M_COMMON_MAGIC;
@@ -234,13 +300,12 @@ static unsigned int setup(unsigned int port, bool fpu, bool control, bool mpu,
 	target.arch_info = &armv7m.arm;
 	target.endianness = big ? TARGET_BIG_ENDIAN : TARGET_LITTLE_ENDIAN;
 	target.state = TARGET_HALTED;
-	target.rtos = &rtos;
-	rtos.type = &rt8_rtos;
-	rtos.target = &target;
-	CHECK(rt8_rtos.create(&target) == ERROR_OK);
-	CHECK(rt8_rtos.get_symbol_list_to_lookup(&rtos.symbols) == ERROR_OK);
-	rtos.symbols[0].address = SYSTEM;
-	rtos.symbols[1].address = SIGNATURE;
+	target_set_examined(&target);
+	CHECK(rtos_create(NULL, &target, "chibios-rt8") == ERROR_OK);
+	rt8_os = target.rtos;
+	CHECK(rt8_rtos.get_symbol_list_to_lookup(&rt8_os->symbols) == ERROR_OK);
+	rt8_os->symbols[0].address = SYSTEM;
+	rt8_os->symbols[1].address = SIGNATURE;
 	memcpy(memory + SIGNATURE, "main", 5);
 	memory[SIGNATURE + 5] = 126;
 	put_u16(SIGNATURE + 6, 8 << 11);
@@ -309,6 +374,7 @@ static unsigned int setup(unsigned int port, bool fpu, bool control, bool mpu,
 		target_buffer_set_u32(&target, live_values[i], 0xa0000000 + i);
 		live_regs[i] = (struct reg) {
 			.number = i, .size = 32, .value = live_values[i], .exist = true, .valid = true,
+			.type = &reg_type,
 		};
 	}
 	return split ? (extended ? 104U : 32U) + (aligned ? 4U : 0U) : inner_size;
@@ -317,19 +383,19 @@ static unsigned int setup(unsigned int port, bool fpu, bool control, bool mpu,
 static void check_threads(void)
 {
 	CHECK(rt8_rtos.detect_rtos(&target));
-	CHECK(rt8_rtos.update_threads(&rtos) == ERROR_OK);
-	CHECK(rtos.thread_count == 2 && rtos.current_thread == MAIN_THREAD);
-	CHECK(rtos.thread_details[0].threadid == MAIN_THREAD);
-	CHECK(rtos.thread_details[1].threadid == WORKER_THREAD);
-	CHECK(!strcmp(rtos.thread_details[0].thread_name_str, "main"));
-	CHECK(!strcmp(rtos.thread_details[1].extra_info_str, "State: SLEEPING, Priority: 64, Core: 0"));
+	CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+	CHECK(rt8_os->thread_count == 2 && rt8_os->current_thread == MAIN_THREAD);
+	CHECK(rt8_os->thread_details[0].threadid == MAIN_THREAD);
+	CHECK(rt8_os->thread_details[1].threadid == WORKER_THREAD);
+	CHECK(!strcmp(rt8_os->thread_details[0].thread_name_str, "main"));
+	CHECK(!strcmp(rt8_os->thread_details[1].extra_info_str, "State: SLEEPING, Priority: 64, Core: 0"));
 }
 
 static uint64_t get_register(unsigned int number, unsigned int expected_bits)
 {
 	uint8_t *value;
 	uint32_t size;
-	CHECK(rt8_rtos.get_thread_reg_value(&rtos, WORKER_THREAD, number, &size, &value) == ERROR_OK);
+	CHECK(rt8_rtos.get_thread_reg_value(rt8_os, WORKER_THREAD, number, &size, &value) == ERROR_OK);
 	CHECK(size == expected_bits);
 	uint64_t result = 0;
 	unsigned int bytes = DIV_ROUND_UP(size, 8);
@@ -345,7 +411,7 @@ static void unavailable(unsigned int number)
 {
 	uint8_t *value = NULL;
 	uint32_t size;
-	CHECK(rt8_rtos.get_thread_reg_value(&rtos, WORKER_THREAD, number, &size, &value) == ERROR_OK);
+	CHECK(rt8_rtos.get_thread_reg_value(rt8_os, WORKER_THREAD, number, &size, &value) == ERROR_OK);
 	CHECK(!value && size == (number >= ARMV7M_D0 && number <= ARMV7M_D15 ? 64U : 32U));
 }
 
@@ -363,7 +429,7 @@ static void test_contexts(void)
 			check_threads();
 			struct rtos_reg *regs;
 			int count;
-			CHECK(rt8_rtos.get_thread_reg_list(&rtos, WORKER_THREAD, &regs, &count) == ERROR_OK);
+			CHECK(rt8_rtos.get_thread_reg_list(rt8_os, WORKER_THREAD, &regs, &count) == ERROR_OK);
 			CHECK(count == ARMV7M_NUM_CORE_REGS);
 			for (unsigned int i = 4; i <= 11; i++)
 				CHECK(target_buffer_get_u32(&target, regs[i].value) == 0x10000000 + i);
@@ -403,7 +469,7 @@ static void test_contexts(void)
 			target_buffer_set_u32(&target, msp_value, 0x3000);
 			CHECK(get_register(ARMV7M_MSP, 32) == 0x3000);
 			unavailable(ARMV7M_PRIMASK);
-			CHECK(rt8_rtos.get_thread_reg_list(&rtos, MAIN_THREAD, &regs, &count) == ERROR_OK);
+			CHECK(rt8_rtos.get_thread_reg_list(rt8_os, MAIN_THREAD, &regs, &count) == ERROR_OK);
 			CHECK(target_buffer_get_u32(&target, regs[4].value) == 0xa0000004);
 			free(regs);
 			teardown();
@@ -417,29 +483,29 @@ static void test_registry(void)
 	for (unsigned int big = 0; big < 2; big++) {
 		setup(4, true, true, true, false, false, big);
 		check_threads();
-		rtos.current_threadid = WORKER_THREAD;
+		rt8_os->current_threadid = WORKER_THREAD;
 		check_threads();
-		CHECK(rtos.current_threadid == WORKER_THREAD);
+		CHECK(rt8_os->current_threadid == WORKER_THREAD);
 		put_u32(INSTANCE + 12, WORKER_THREAD);
-		CHECK(rt8_rtos.update_threads(&rtos) == ERROR_OK);
-		CHECK(rtos.thread_details[0].threadid == WORKER_THREAD);
-		CHECK(rtos.current_thread == WORKER_THREAD);
+		CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+		CHECK(rt8_os->thread_details[0].threadid == WORKER_THREAD);
+		CHECK(rt8_os->current_thread == WORKER_THREAD);
 		put_u32(INSTANCE + 12, MAIN_THREAD);
 		memcpy(memory + sizeof(memory) - 4, "end", 4);
 		put_u32(WORKER_THREAD + 336, sizeof(memory) - 4);
-		CHECK(rt8_rtos.update_threads(&rtos) == ERROR_OK);
-		CHECK(!strcmp(rtos.thread_details[1].thread_name_str, "end"));
+		CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+		CHECK(!strcmp(rt8_os->thread_details[1].thread_name_str, "end"));
 		/* Configurations can vary enum and state widths. */
 		memory[SIGNATURE + 11] = 10;
 		put_u32(SYSTEM, 3);
 		memory[SIGNATURE + 10] = 2;
 		put_u32(WORKER_THREAD + 340, 8);
-		CHECK(rt8_rtos.update_threads(&rtos) == ERROR_OK);
-		CHECK(strstr(rtos.thread_details[1].extra_info_str, "SLEEPING"));
+		CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+		CHECK(strstr(rt8_os->thread_details[1].extra_info_str, "SLEEPING"));
 		put_u32(SYSTEM, 0);
-		CHECK(rt8_rtos.update_threads(&rtos) == ERROR_OK);
-		CHECK(rtos.thread_count == 1 && rtos.current_thread == 1);
-		CHECK(!strcmp(rtos.thread_details[0].thread_name_str, "Current Execution"));
+		CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+		CHECK(rt8_os->thread_count == 1 && rt8_os->current_thread == 1);
+		CHECK(!strcmp(rt8_os->thread_details[0].thread_name_str, "Current Execution"));
 		teardown();
 		cases++;
 	}
@@ -466,8 +532,8 @@ static void test_bad_layouts(void)
 		else
 			put_u16(SIGNATURE + mutations[i].offset, mutations[i].value);
 		CHECK(!rt8_rtos.detect_rtos(&target));
-		CHECK(rt8_rtos.update_threads(&rtos) != ERROR_OK);
-		CHECK(rtos.thread_count == 0);
+		CHECK(rt8_rtos.update_threads(rt8_os) != ERROR_OK);
+		CHECK(rt8_os->thread_count == 0);
 		teardown();
 		cases++;
 	}
@@ -500,8 +566,8 @@ static void test_faults(void)
 			put_u16(SIGNATURE + 40, NONE);
 			break;
 		}
-		CHECK(rt8_rtos.update_threads(&rtos) != ERROR_OK);
-		CHECK(!rtos.thread_count && !rtos.thread_details);
+		CHECK(rt8_rtos.update_threads(rt8_os) != ERROR_OK);
+		CHECK(!rt8_os->thread_count && !rt8_os->thread_details);
 		teardown();
 		cases++;
 	}
@@ -521,11 +587,267 @@ static void test_faults(void)
 		}
 		struct rtos_reg *regs = NULL;
 		int count;
-		CHECK(rt8_rtos.get_thread_reg_list(&rtos, WORKER_THREAD, &regs, &count) != ERROR_OK);
+		CHECK(rt8_rtos.get_thread_reg_list(rt8_os, WORKER_THREAD, &regs, &count) != ERROR_OK);
 		CHECK(!regs && !count);
 		teardown();
 		cases++;
 	}
+}
+
+static void setup_smp(unsigned int port, bool shared, bool big)
+{
+	setup(port, port > 2, port == 4 || port == 6, false, port == 4 || port == 6, false, big);
+	secondary = target;
+	secondary.next = NULL;
+	secondary_arm = armv7m;
+	secondary.arch_info = &secondary_arm.arm;
+	secondary.rtos = NULL;
+	secondary.reg_cache = &caches[1];
+	target.coreid = 3;
+	secondary.coreid = 7;
+	CHECK(rtos_create(NULL, &secondary, "chibios-rt8") == ERROR_OK);
+	/* List order deliberately differs from the ChibiOS instance order. */
+	members[0].target = &secondary;
+	members[1].target = &target;
+	list_add_tail(&members[0].lh, &smp_targets);
+	list_add_tail(&members[1].lh, &smp_targets);
+	target.smp = true;
+	secondary.smp = true;
+	CHECK(rtos_smp_init(&target) == ERROR_OK);
+	CHECK(target.rtos == secondary.rtos && rt8_os->target == &target);
+	CHECK(!rt8_rtos.detect_rtos(&target)); /* Explicit selection for SMP. */
+	for (unsigned int i = 0; i < ARMV7M_NUM_CORE_REGS; i++) {
+		target_buffer_set_u32(&secondary, secondary_values[i], 0xb0000000 + i);
+		secondary_regs[i] = (struct reg) {
+			.number = i, .size = 32, .value = secondary_values[i], .exist = true, .valid = true,
+			.type = &reg_type,
+		};
+	}
+	target_buffer_set_u32(&target, msp_value, 0x3100);
+	target_buffer_set_u32(&secondary, secondary_msp, 0x3200);
+	put_u16(SIGNATURE + 18, 80); /* system size */
+	put_u16(SIGNATURE + 20, 8);  /* sparse instance slots */
+	put_u32(SYSTEM + 4, 0);
+	put_u32(SYSTEM + 4 + 3 * 4, INSTANCE);
+	put_u32(SYSTEM + 4 + 7 * 4, SECOND_INSTANCE);
+	put_u32(INSTANCE + 400, 3);
+	put_u32(SECOND_INSTANCE + 400, 7);
+	put_u32(SECOND_INSTANCE + 12, SECOND_THREAD);
+	memcpy(memory + SECOND_THREAD, memory + MAIN_THREAD, 384);
+	put_u32(SECOND_THREAD + 300, SECOND_INSTANCE);
+	put_u32(WORKER_THREAD + 300, SECOND_INSTANCE);
+	if (shared) {
+		memory[SIGNATURE + 8] = 1;
+		put_u16(SIGNATURE + 26, 48);
+		put_u16(SIGNATURE + 40, NONE);
+		put_u32(SHARED_REGISTRY, MAIN_THREAD + NODE);
+		put_u32(SHARED_REGISTRY + 4, SECOND_THREAD + NODE);
+		put_u32(MAIN_THREAD + NODE + 4, SHARED_REGISTRY);
+		put_u32(WORKER_THREAD + NODE, SECOND_THREAD + NODE);
+		put_u32(SECOND_THREAD + NODE + 4, WORKER_THREAD + NODE);
+		put_u32(SECOND_THREAD + NODE, SHARED_REGISTRY);
+	} else {
+		put_u32(REGISTRY + 4, MAIN_THREAD + NODE);
+		put_u32(MAIN_THREAD + NODE, REGISTRY);
+		unsigned int head = SECOND_INSTANCE + 512;
+		put_u32(head, WORKER_THREAD + NODE);
+		put_u32(head + 4, SECOND_THREAD + NODE);
+		put_u32(WORKER_THREAD + NODE + 4, head);
+		put_u32(WORKER_THREAD + NODE, SECOND_THREAD + NODE);
+		put_u32(SECOND_THREAD + NODE + 4, WORKER_THREAD + NODE);
+		put_u32(SECOND_THREAD + NODE, head);
+	}
+}
+
+static void packet(const char *text)
+{
+	CHECK(gdb_thread_packet(&connection, text, strlen(text)) == ERROR_OK);
+}
+
+static void test_smp(void)
+{
+	for (unsigned int port = 1; port <= 6; port++) {
+		for (unsigned int flags = 0; flags < 4; flags++) {
+			setup_smp(port, flags & 1, flags & 2);
+			packet("Hg0"); /* Attachment precedes symbol negotiation. */
+			CHECK(!strcmp(reply, "OK") && gdb_service.target == &target);
+			CHECK(!rtos_needs_fake_step(&target, 0));
+			/* Symbol negotiation and thread packets use the real RTOS core. */
+			packet("qSymbol::");
+			CHECK(!strcmp(reply, "qSymbol:63685f73797374656d"));
+			packet("qSymbol:300:63685f73797374656d");
+			CHECK(!strcmp(reply, "qSymbol:63685f6465627567"));
+			packet("qSymbol:100:63685f6465627567");
+			CHECK(!strcmp(reply, "OK"));
+			CHECK(rt8_os->thread_count == 3 && rt8_os->current_thread == MAIN_THREAD);
+			packet("qfThreadInfo");
+			CHECK(strstr(reply, "0000000000000800") && strstr(reply, "0000000000001400"));
+			packet("Hg1400");
+			CHECK(!strcmp(reply, "OK") && gdb_service.target == &secondary);
+			CHECK(rt8_os->current_threadid == SECOND_THREAD);
+			CHECK(rtos_get_gdb_reg(&connection, ARMV7M_R4) == ERROR_OK);
+			CHECK(!strcmp(reply, flags & 2 ? "b0000004" : "040000b0"));
+			CHECK(rtos_get_gdb_reg(&connection, ARMV7M_MSP) == ERROR_OK);
+			CHECK(!strcmp(reply, flags & 2 ? "00003200" : "00320000"));
+			CHECK(rtos_get_gdb_reg_list(&connection) == ERROR_OK);
+			CHECK(!strncmp(reply, flags & 2 ? "b0000000" : "000000b0", 8));
+			uint8_t new_value[4] = { 1, 2, 3, 4 };
+			CHECK(rtos_set_reg(&connection, ARMV7M_R4, new_value) == ERROR_OK);
+			CHECK(writes == 1 && written_reg == &secondary_regs[ARMV7M_R4]);
+			write_result = ERROR_TARGET_FAILURE;
+			CHECK(rtos_set_reg(&connection, ARMV7M_R4, new_value) == ERROR_TARGET_FAILURE);
+			write_result = ERROR_OK;
+			CHECK(!rtos_needs_fake_step(&target, SECOND_THREAD));
+			CHECK(!rtos_needs_fake_step(&secondary, MAIN_THREAD));
+			CHECK(rtos_needs_fake_step(&target, WORKER_THREAD));
+			CHECK(rtos_swbp_target(&secondary, 0x2000, 2, BKPT_SOFT) == &target);
+			packet("Hg800");
+			CHECK(gdb_service.target == &target);
+			CHECK(rtos_get_gdb_reg(&connection, ARMV7M_R4) == ERROR_OK);
+			CHECK(!strcmp(reply, flags & 2 ? "a0000004" : "040000a0"));
+			CHECK(rtos_set_reg(&connection, ARMV7M_R4, new_value) == ERROR_OK);
+			CHECK(writes == 3 && written_reg == &live_regs[ARMV7M_R4]);
+			packet("Hgc00");
+			CHECK(rtos_set_reg(&connection, ARMV7M_R4, new_value) == ERROR_FAIL);
+			CHECK(writes == 3);
+			CHECK(rtos_get_gdb_reg(&connection, ARMV7M_R4) == ERROR_OK);
+			CHECK(!strcmp(reply, flags & 2 ? "10000004" : "04000010"));
+			CHECK(get_register(ARMV7M_MSP, 32) == 0x3200);
+			if (port == 4 || port == 6) {
+				CHECK(get_register(ARMV7M_D0, 64) == UINT64_C(0x3f0000013f000000));
+				secondary_fpccr = 1;
+				secondary_fpcar = STACK + 32;
+				unavailable(ARMV7M_D0);
+				unavailable(ARMV7M_FPSCR);
+				secondary_fpccr = 0;
+				/* Lazy state on a different core must also be respected. */
+				fpccr = 1;
+				fpcar = STACK + 32;
+				unavailable(ARMV7M_D0);
+			}
+			packet("Hgdead");
+			CHECK(!strcmp(reply, "E01") && rt8_os->current_threadid == WORKER_THREAD);
+			target.debug_reason = DBG_REASON_DBGRQ;
+			secondary.debug_reason = DBG_REASON_BREAKPOINT;
+			CHECK(rtos_update_threads(&target) == ERROR_OK);
+			CHECK(rt8_os->current_thread == SECOND_THREAD);
+			packet("qC");
+			CHECK(!strcmp(reply, "QC0000000000001400"));
+			struct target *cpu = NULL;
+			CHECK(rt8_os->gdb_target_for_threadid(&connection, SECOND_THREAD, &cpu) == ERROR_OK);
+			CHECK(cpu == &secondary);
+			target.debug_reason = DBG_REASON_SINGLESTEP;
+			CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+			CHECK(rt8_os->current_thread == MAIN_THREAD);
+			/* Equal stop reasons prefer the selected live thread. */
+			secondary.debug_reason = DBG_REASON_SINGLESTEP;
+			packet("Hg1400");
+			CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+			CHECK(rt8_os->current_thread == SECOND_THREAD);
+			packet("Hg0");
+			CHECK(rt8_os->current_threadid == SECOND_THREAD);
+			/* A running peer must prevent even the initial memory read. */
+			secondary.state = TARGET_RUNNING;
+			unsigned int old_reads = reads;
+			CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_TARGET_NOT_HALTED);
+			CHECK(reads == old_reads && rt8_os->thread_count == 0);
+			CHECK(rtos_needs_fake_step(&target, SECOND_THREAD));
+			CHECK(rt8_os->gdb_target_for_threadid(&connection, SECOND_THREAD, &cpu) == ERROR_OK);
+			CHECK(cpu == &secondary); /* Ctrl-C still has a usable target. */
+			secondary.state = TARGET_HALTED;
+			CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+			/* Reset drops the old selection and uses the boot placeholder. */
+			memory[SYSTEM] = 0;
+			CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+			CHECK(rt8_os->thread_count == 1 && rt8_os->current_thread == 1);
+			packet("Hg1");
+			CHECK(gdb_service.target == &target);
+			CHECK(!rtos_needs_fake_step(&target, 1));
+			CHECK(rtos_get_gdb_reg_list(&connection) == ERROR_OK);
+			teardown();
+			CHECK(!target.rtos && !secondary.rtos);
+			cases++;
+		}
+	}
+}
+
+static void test_smp_faults(void)
+{
+	for (unsigned int fault = 0; fault < 13; fault++) {
+		setup_smp(6, true, false);
+		switch (fault) {
+		case 0:
+			secondary.coreid = target.coreid;
+			break;
+		case 1:
+			secondary.coreid = 8;
+			break;
+		case 2:
+			secondary.endianness = TARGET_BIG_ENDIAN;
+			break;
+		case 3:
+			secondary.examined = false;
+			break;
+		case 4:
+			secondary.state = TARGET_UNAVAILABLE;
+			break;
+		case 5:
+			secondary_arm.arm.arch = ARM_ARCH_V7M;
+			break;
+		case 6:
+			put_u32(SECOND_INSTANCE + 400, 3);
+			break;
+		case 7:
+			put_u32(SECOND_INSTANCE + 12, MAIN_THREAD);
+			break;
+		case 8:
+			put_u32(WORKER_THREAD + 300, 0x1800);
+			break;
+		case 9:
+			put_u32(SYSTEM + 4 + 7 * 4, 0);
+			break;
+		case 10:
+			put_u32(SECOND_INSTANCE + 12, 0);
+			break;
+		case 11:
+			read_fault = SECOND_INSTANCE + 400;
+			break;
+		case 12:
+			secondary_arm.fp_feature = 1;
+			break;
+		}
+		CHECK(rt8_rtos.update_threads(rt8_os) != ERROR_OK);
+		CHECK(!rt8_os->thread_count);
+		struct target *cpu = NULL;
+		CHECK(rt8_os->gdb_target_for_threadid(&connection, SECOND_THREAD, &cpu) != ERROR_OK);
+		CHECK(cpu); /* GDB stop-reply callers may ignore the error. */
+		teardown();
+		cases++;
+	}
+	/* An unpublished secondary instance is valid while its core is halted. */
+	setup_smp(3, true, false);
+	put_u32(SYSTEM + 4 + 7 * 4, 0);
+	put_u32(MAIN_THREAD + NODE, SHARED_REGISTRY);
+	put_u32(SHARED_REGISTRY + 4, MAIN_THREAD + NODE);
+	CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+	CHECK(rt8_os->thread_count == 1 && rt8_os->current_thread == MAIN_THREAD);
+	/* Published before current is set is also a valid startup state. */
+	put_u32(SYSTEM + 4 + 7 * 4, SECOND_INSTANCE);
+	put_u32(SECOND_INSTANCE + 12, 0);
+	CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+	CHECK(rt8_os->thread_count == 1);
+	teardown();
+	cases++;
+	/* Destroying/reconfiguring any alias frees a shared RTOS only once. */
+	setup_smp(3, true, false);
+	CHECK(rt8_rtos.update_threads(rt8_os) == ERROR_OK);
+	/* Aliases must also be detached after the SMP group was dismantled. */
+	target.smp = false;
+	secondary.smp = false;
+	rtos_destroy(&secondary);
+	CHECK(!target.rtos && !secondary.rtos);
+	teardown();
+	cases++;
 }
 
 int main(void)
@@ -534,6 +856,8 @@ int main(void)
 	test_registry();
 	test_bad_layouts();
 	test_faults();
+	test_smp();
+	test_smp_faults();
 	printf("PASS: %u RT8 context, registry and rejection cases\n", cases);
 	return EXIT_SUCCESS;
 }
